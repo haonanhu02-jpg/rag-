@@ -2,7 +2,7 @@
 document_id: FRAMEWORK-REPLACEMENT-PLAN
 document_role: RAGFlow 三桶拆解与 LangChain/LangGraph 框架替代实施计划（下一轮路线图提议）
 status: proposed
-document_version: "0.1.0"
+document_version: "0.2.0"
 created_at: "2026-08-17"
 last_updated_at: "2026-08-17"
 project_root: "D:/download/ragflow-agent"
@@ -116,7 +116,7 @@ ragflow_reference_commit: "cd846cc9d4e32a19e684c59a1f302601027ef976"
 | A.2 查询改写/翻译/关键词 | `knowledge/application/query/transforms.py`、`preprocess.py` | ✅ 编排自研（正确）；模型调用走 `QueryTransformProviderPort` | 代码可见 |
 | A.2 Reranker | `knowledge/infrastructure/models/bge_reranker.py` | ✅ 端口隔离自研（正确）；LangChain 无更优的本地 BGE 集成 | 代码可见 |
 | A.2 Agentic RAG 编排 | `agent/graphs/agentic_rag.py` + `agent/application/agentic_runtime.py` | ✅ LangGraph + 自研治理（Evidence/Budget/HITL/Memory） | ADR-023 |
-| A.2 记忆 | `agent/application/memory.py` | ✅ LangGraph checkpoint + 自研治理（consent/TTL/隔离） | ADR-023 |
+| A.2 记忆 | `agent/application/memory.py` | ✅ 自研 `LongTermMemoryService` + `MemoryRepositoryPort`（consent/TTL/敏感过滤/租户+用户隔离）；LangGraph Checkpointer 仅管 run/thread 状态（`agent/infrastructure/checkpoint/postgres.py`） | ADR-023 |
 | A.3-A 知识检索能力 | `agent/tools/knowledge_base.py`（KnowledgeBaseTool） | ✅ 正确自研，走共享 `KnowledgeQueryService` | ADR-009 |
 | A.3-B 解析/OCR | `knowledge/infrastructure/parsers/*`、`ocr/tesseract.py` | ✅ 正确自研（八格式 + Tesseract + 资源门禁） | ADR-020 |
 | A.3-C 生命周期/权限/Trace/评测/API/Worker | `knowledge/application/lifecycle/*`、`permission_service.py`、`api/`、`worker/`、`knowledge/evaluation/` | ✅ 正确自研（产品壳与领域治理） | ADR-022/018/021 |
@@ -181,6 +181,44 @@ C.1 复核（0 代码，必做） → C.2 微整合（可选） → C.3 候选�
 - C.1 是唯一"必做"；C.2/C.3 都由 C.1 的证据决定是否立项。
 - 任何进入实现的任务，必须先形成 ADR 并经用户确认（AGENTS.md 第 5、6 条）。
 
+### C.5 执行记录：FR-T01/FR-T02/FR-T03 结论（2026-08-17）
+
+#### FR-T01：现状复核结果（逐项与代码/测试核对）
+
+| Part B 行 | 核对结论 | 证据（源码 + 测试） |
+|---|---|---|
+| A.1 LLM 调用 | ✅ 一致：`LangChainChatProvider` 经 `ChatOpenAI.ainvoke` | `knowledge/infrastructure/models/langchain_openai.py`；`tests/contract/embedding/test_langchain_adapter.py` |
+| A.1 Embedding | ✅ 一致：`LangChainEmbeddingAdapter` 经 `OpenAIEmbeddings.aembed_documents` | 同 `langchain_openai.py`；`tests/contract/embedding/test_langchain_adapter.py` |
+| A.1 结构化输出 | ✅ 一致：`with_structured_output(ModelDecision)` | `agent/infrastructure/langchain/model.py`；`tests/unit/agent/test_graph_routes.py` |
+| A.1 Agent 循环 | ✅ 一致：自定义 `StateGraph`（治理设计），未用 `create_react_agent` | `agent/graphs/minimal_agent.py`、`agentic_rag.py`（`interrupt` 实现 HITL）；`tests/e2e/agent/test_minimal_agent.py` |
+| A.1 Checkpoint | ✅ 一致：官方 `AsyncPostgresSaver` + `TenantScopedCheckpointStore` | `agent/infrastructure/checkpoint/postgres.py`、`scoped.py`；`tests/integration/agent/test_checkpoint.py`、`test_runtime_recovery.py` |
+| A.1 纯文本切块 | ✅ 一致：自研 `_TOKEN_PATTERN` 滑动窗口（候选 G-3） | `knowledge/infrastructure/chunking/general.py`；`tests/unit/chunking/test_general.py` |
+| A.2 固定 RAG | ✅ 一致：检索/上下文预算自研；模型走 `ChatProviderPort`；提示词硬编码（候选 G-1） | `knowledge/application/fixed_rag.py`；`tests/unit/rag/test_answer.py` |
+| A.2 检索管道 | ✅ 一致：全文/向量双路 + RRF + Rerank 回退 + 降级 + 权限 + Trace | `knowledge/application/query/retrieve.py` 及 `fusion/rerank/fallback/clean/filters`；`tests/unit/retrieval/*`、`tests/e2e/retrieval/test_real_online_pipeline.py` |
+| A.2 查询改写/翻译/关键词 | ✅ 一致：`QueryVariantBuilder` 编排自研，模型走 `QueryTransformProviderPort` | `query/transforms.py`、`preprocess.py`；`tests/unit/retrieval/test_preprocess_and_transforms.py` |
+| A.2 Reranker | ✅ 一致：`BgeRerankerAdapter` 为 httpx 直连 `/rerank`，端口隔离自研（未用 LangChain，正确） | `knowledge/infrastructure/models/bge_reranker.py`；`tests/unit/retrieval/test_fusion_rerank.py` |
+| A.2 Agentic RAG 编排 | ✅ 一致：LangGraph `StateGraph` + `interrupt`(HITL) + Budget/Evidence 自研环绕 | `agent/graphs/agentic_rag.py`；`tests/evaluation/agentic/*` |
+| A.2 记忆 | ⚠️ 已修正措辞：长期记忆为自研 `LongTermMemoryService` + `MemoryRepositoryPort`；LangGraph Checkpointer 仅管 run/thread 状态（原文已更新） | `agent/application/memory.py` |
+| A.3-A 知识检索能力 | ✅ 一致：`KnowledgeBaseTool` + `as_langchain_tool()`（`StructuredTool`），走共享 `KnowledgeQueryService` | `agent/tools/knowledge_base.py`；`tests/contract/agent/test_tools.py` |
+| A.3-B 解析/OCR | ✅ 一致：八格式 Parser + Tesseract + 资源门禁 | `knowledge/infrastructure/parsers/*`、`ocr/tesseract.py`；`tests/golden/parsing/test_format_parsers.py`、`tests/performance/parsing/test_resource_limits.py` |
+| A.3-C 生命周期/权限/Trace/评测/API/Worker | ✅ 一致：自研 | `knowledge/application/lifecycle/*`、`permission_service.py`、`knowledge/evaluation/`；`tests/fault/*`、`tests/evaluation/*` |
+
+测试覆盖基线：`tests/` 下共 108 个 `test_*.py`，分布于 unit / contract / integration / e2e / evaluation / fault / golden / performance。
+
+#### FR-T02：候选差距决策
+
+| 候选 | 决策 | 依据 |
+|---|---|---|
+| G-1 提示词 → `ChatPromptTemplate` | 可选、低收益；采纳才做 C.2 FR-T10 | `fixed_rag.py` 提示词为硬编码字面量；迁移须黄金输出一致 |
+| G-2 固定 RAG 流式 | 待产品需求；当前无流式是范围决定 | `LangChainChatProvider.generate` 单次 `ainvoke`；FR-T11 仅在需要时立项 |
+| G-3 切块 → LangChain `TextSplitter` | **不推荐**：须保持 `sha256-v1` 稳定 ID 与黄金输出；splitter 语义不同 | `general.py` 自研滑动窗口 + `derive_chunk_id`；`tests/unit/chunking/test_general.py` 固定黄金 |
+| G-4 Agent 图 → `create_react_agent` | **不推荐**：会丢失治理（预算/证据/HITL/确定性决策 schema） | `agentic_rag.py` 用 `interrupt` + `BudgetLedger`/`EvidenceSufficiencyPolicy`/`ApprovalService` 环绕节点；现有确定性评测依赖该结构 |
+
+#### FR-T03：能力矩阵与 ADR 建议
+
+- **能力矩阵回填**：待用户批准后更新 `docs/02-ragflow-capability-matrix.md`（属维护文档，不擅自修改）。
+- **ADR 建议**：FR-T01/FR-T02 是 0 代码复核，不改变实现，**无需 ADR**；若采纳任何 C.2/C.3 代码任务，先按 AGENTS.md 形成 ADR 并经用户确认。
+
 ---
 
 ## Part D. 验收与门禁
@@ -208,4 +246,5 @@ C.1 复核（0 代码，必做） → C.2 微整合（可选） → C.3 候选�
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-08-17 | 0.2.0 | 执行 FR-T01：逐项核对 Part B 与代码/测试一致，修正记忆行措辞；FR-T02：对 G-1 至 G-4 作出决策（G-3/G-4 不推荐）；FR-T03：能力矩阵回填待批准，0 代码复核无需 ADR |
 | 2026-08-17 | 0.1.0 | 创建：RAGFlow 三桶拆解、映射到本项目代码的现状复核、下一轮路线图实施计划提议 |
