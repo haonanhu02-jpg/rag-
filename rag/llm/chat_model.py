@@ -1554,15 +1554,6 @@ class FuturMixChat(Base):
         logging.info("[FuturMix] Chat initialized with model %s", model_name)
 
 
-class AIMLAPIChat(Base):
-    _FACTORY_NAME = "aimlapi.com"
-
-    def __init__(self, key, model_name, base_url="", **kwargs):
-        base_url = base_url or os.environ.get("AIMLAPI_API_URL", "https://api.aimlapi.com/v1")
-        super().__init__(key, model_name, base_url, **kwargs)
-        logging.info("[aimlapi.com] Chat initialized with model %s", model_name)
-
-
 class LiteLLMBase(ABC):
     _FACTORY_NAME = [
         "Tongyi-Qianwen",
@@ -2349,3 +2340,172 @@ class NewAPIChat(Base):
             raise ValueError("url cannot be None")
         model_name = model_name.split("___")[0]
         super().__init__(key, model_name, base_url, **kwargs)
+
+
+def _langchain_usage(meta: dict | None) -> dict:
+    """Map a langchain ``usage_metadata`` dict to RAGFlow's usage split.
+
+    langchain names the fields ``input_tokens`` / ``output_tokens`` /
+    ``total_tokens``; RAGFlow consumers expect ``prompt_tokens`` /
+    ``completion_tokens`` / ``total_tokens`` (see ``usage_from_response``).
+    """
+    meta = meta or {}
+    return {
+        "prompt_tokens": int(meta.get("input_tokens", 0) or 0),
+        "completion_tokens": int(meta.get("output_tokens", 0) or 0),
+        "total_tokens": int(meta.get("total_tokens", 0) or 0),
+    }
+
+
+def _langchain_finish_reason(message) -> str:
+    """Read ``finish_reason`` from a langchain message's response metadata."""
+    meta = getattr(message, "response_metadata", None) or {}
+    return meta.get("finish_reason", "") or ""
+
+
+class LangChainChat(Base):
+    """
+    LangChain-backed chat provider (framework replacement for the self-written
+    OpenAI-compatible thin wrappers).
+
+    Routes RAGFlow's chat calls through ``langchain_openai.ChatOpenAI`` instead
+    of the hand-rolled ``openai`` SDK plumbing in :class:`Base`. It keeps the
+    same external contract (``async_chat`` / ``async_chat_streamly`` and the
+    retry/error-classification behaviour inherited from ``Base``), so existing
+    callers are unaffected. This is an *opt-in* provider: the default providers
+    are untouched, so switching to it never loses functionality — it only adds
+    a LangChain-routed option.
+
+    First version scope: non-tool chat path (fixed-RAG Q&A). Tool-bound calls
+    raise a clear :class:`NotImplementedError` rather than silently failing on
+    a missing OpenAI client.
+    """
+
+    _FACTORY_NAME = "LangChain"
+
+    def __init__(self, key, model_name, base_url, **kwargs):
+        if not base_url:
+            raise ValueError("url cannot be None")
+        from langchain_openai import ChatOpenAI
+
+        self.timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", 600))
+        self.base_url = ensure_v1(base_url)
+        self.model_name = model_name
+        # Configure retry parameters (langchain is told not to retry; RAGFlow's
+        # Base._exceptions_async owns backoff so the behaviour is uniform).
+        self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
+        self.base_delay = kwargs.get("retry_interval", float(os.environ.get("LLM_BASE_DELAY", 2.0)))
+        self.max_rounds = kwargs.get("max_rounds", 5)
+        self.is_tools = False
+        self.tools = []
+        self.toolcall_sessions = {}
+        self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.llm = ChatOpenAI(
+            model=model_name,
+            api_key=key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=0,
+        )
+
+    async def _async_chat(self, history, gen_conf, **kwargs):
+        logging.info("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        if self.model_name.lower().find("qwq") >= 0:
+            final_ans = ""
+            tol_token = 0
+            async for delta, tol in self._async_chat_streamly(history, gen_conf, with_reasoning=False, **kwargs):
+                if delta.startswith("<think>") or delta.endswith("</think>"):
+                    continue
+                final_ans += delta
+                tol_token = tol
+            if len(final_ans.strip()) == 0:
+                final_ans = "**ERROR**: Empty response from reasoning model"
+            return final_ans.strip(), tol_token
+
+        gen_conf, kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="base",
+            gen_conf=gen_conf,
+            request_kwargs=kwargs,
+        )
+        gen_conf.pop("stream", None)
+        gen_conf.pop("stream_options", None)
+
+        response = await self.llm.ainvoke(history, **gen_conf, **kwargs)
+        self.last_usage = _langchain_usage(getattr(response, "usage_metadata", None))
+        content = getattr(response, "content", None) or ""
+        if not content:
+            return "", 0
+        ans = content.strip()
+        if _langchain_finish_reason(response) == "length":
+            ans = self._length_stop(ans)
+        total = self.last_usage.get("total_tokens", 0)
+        return ans, total
+
+    async def _async_chat_streamly(self, history, gen_conf, **kwargs):
+        logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        reasoning_start = False
+        total_tokens = 0
+        # Reset so a stale split from a previous call can't leak into this one.
+        self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        gen_conf, extra_request_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="base",
+            gen_conf=gen_conf,
+            request_kwargs={},
+        )
+        gen_conf.pop("stream", None)
+        request_kwargs = {**gen_conf, **extra_request_kwargs}
+        stop = kwargs.get("stop")
+        if stop:
+            request_kwargs["stop"] = stop
+
+        async for chunk in self.llm.astream(history, **request_kwargs):
+            usage_meta = getattr(chunk, "usage_metadata", None)
+            chunk_tokens = 0
+            if usage_meta and usage_meta.get("total_tokens"):
+                # Authoritative usage arrives on the final chunk (include_usage).
+                chunk_tokens = int(usage_meta["total_tokens"])
+                total_tokens = chunk_tokens
+                self.last_usage = _langchain_usage(usage_meta)
+
+            content = getattr(chunk, "content", None) or ""
+            _reasoning = getattr(chunk, "reasoning_content", None) or getattr(chunk, "reasoning", None)
+            if kwargs.get("with_reasoning", True) and _reasoning:
+                ans = ""
+                if not reasoning_start:
+                    reasoning_start = True
+                    ans = "<think>"
+                ans += _reasoning + "</think>"
+            else:
+                reasoning_start = False
+                ans = content
+
+            if not ans:
+                # Usage-only final chunk: still deliver the authoritative count.
+                if chunk_tokens:
+                    yield "", chunk_tokens
+                continue
+            if _langchain_finish_reason(chunk) == "length":
+                if is_chinese(ans):
+                    ans += LENGTH_NOTIFICATION_CN
+                else:
+                    ans += LENGTH_NOTIFICATION_EN
+            yield ans, chunk_tokens
+
+    async def async_chat_with_tools(self, system, history, gen_conf=None, **kwargs):
+        raise NotImplementedError(
+            "LangChain provider: tool-bound chat is not implemented in the first "
+            "version. Use a default provider (e.g. OpenAI / DeepSeek / Ollama) for "
+            "agentic flows, or the non-tool fixed-RAG path with this provider."
+        )
+
+    async def async_chat_streamly_with_tools(self, system, history, gen_conf=None, **kwargs):
+        raise NotImplementedError(
+            "LangChain provider: tool-bound chat is not implemented in the first "
+            "version. Use a default provider (e.g. OpenAI / DeepSeek / Ollama) for "
+            "agentic flows, or the non-tool fixed-RAG path with this provider."
+        )
+        yield  # pragma: no cover - unreachable; makes this an async generator so
+        # `async for` on the caller side surfaces the NotImplementedError above.

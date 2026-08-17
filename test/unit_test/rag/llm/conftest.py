@@ -60,11 +60,43 @@ def _install_rag_llm_stub():
     class SupportedLiteLLMProvider(StrEnum):
         Tongyi_Qianwen = "Tongyi-Qianwen"
         Dashscope = "Dashscope"
+        Bedrock = "Bedrock"
         Moonshot = "Moonshot"
+        xAI = "xAI"
+        DeepInfra = "DeepInfra"
+        Groq = "Groq"
+        Cohere = "Cohere"
+        Gemini = "Gemini"
+        DeepSeek = "DeepSeek"
+        Nvidia = "NVIDIA"
+        TogetherAI = "TogetherAI"
+        Anthropic = "Anthropic"
+        Ollama = "Ollama"
+        LongCat = "LongCat"
+        CometAPI = "CometAPI"
+        SILICONFLOW = "SILICONFLOW"
+        OpenRouter = "OpenRouter"
+        StepFun = "StepFun"
+        PPIO = "PPIO"
+        PerfXCloud = "PerfXCloud"
+        Upstage = "Upstage"
+        NovitaAI = "NovitaAI"
+        Lingyi_AI = "01.AI"
+        GiteeAI = "GiteeAI"
+        AI_302 = "302.AI"
+        JiekouAI = "Jiekou.AI"
         ZHIPU_AI = "ZHIPU-AI"
+        MiniMax = "MiniMax"
+        DeerAPI = "DeerAPI"
+        GPUStack = "GPUStack"
         OpenAI = "OpenAI"
         Azure_OpenAI = "Azure-OpenAI"
+        n1n = "n1n"
         HunYuan = "Tencent Hunyuan"
+        Avian = "Avian"
+        Astraflow = "Astraflow"
+        Astraflow_CN = "Astraflow-CN"
+        FuturMix = "FuturMix"
 
     llm_pkg.SupportedLiteLLMProvider = SupportedLiteLLMProvider
     llm_pkg.FACTORY_DEFAULT_BASE_URL = {}
@@ -73,3 +105,36 @@ def _install_rag_llm_stub():
 
 
 _install_rag_llm_stub()
+
+
+def _install_common_settings_stub():
+    """Replace common.settings with a lazy stub when the real one can't load.
+
+    ``rag.llm.embedding_model`` does ``from common import settings`` at module
+    top, and the real ``common.settings`` pulls in the full storage stack
+    (elasticsearch_dsl, minio, valkey, opendal, infinity-sdk, ...) which is not
+    installed in the offline unit-test environment. None of the embedding-model
+    unit tests construct ``BuiltinEmbed`` (the only class that reads
+    ``settings.EMBEDDING_CFG``), so a stub that raises on attribute access is
+    safe. Install it only when the real module cannot be imported, so CI with
+    the full dependency set still exercises the genuine settings.
+    """
+    if "common.settings" in sys.modules:
+        return
+    try:
+        import common.settings  # noqa: F401
+
+        return
+    except Exception:
+        pass
+
+    settings_stub = types.ModuleType("common.settings")
+
+    def _missing(_name):
+        raise AttributeError("common.settings is stubbed in the unit-test environment")
+
+    settings_stub.__getattr__ = _missing
+    sys.modules["common.settings"] = settings_stub
+
+
+_install_common_settings_stub()

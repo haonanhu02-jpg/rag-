@@ -26,7 +26,7 @@ import numpy as np
 import requests
 from ollama import Client
 from openai import OpenAI
-from zai import ZhipuAiClient
+from zhipuai import ZhipuAI
 
 from common import settings
 from common.exceptions import ModelException
@@ -356,15 +356,6 @@ class FuturMixEmbed(OpenAIEmbed):
         logging.info("[FuturMix] Embedding initialized with model %s", model_name)
 
 
-class AIMLAPIEmbed(OpenAIEmbed):
-    _FACTORY_NAME = "aimlapi.com"
-
-    def __init__(self, key, model_name="text-embedding-3-small", base_url=""):
-        base_url = base_url or os.environ.get("AIMLAPI_API_URL", "https://api.aimlapi.com/v1")
-        super().__init__(key, model_name, base_url)
-        logging.info("[aimlapi.com] Embedding initialized with model %s", model_name)
-
-
 class BaiChuanEmbed(OpenAIEmbed):
     _FACTORY_NAME = "BaiChuan"
 
@@ -445,8 +436,7 @@ class ZhipuEmbed(Base):
     _FACTORY_NAME = "ZHIPU-AI"
 
     def __init__(self, key, model_name="embedding-2", **kwargs):
-        self.client = ZhipuAiClient(api_key=key)
-        logger.info("ZhipuEmbed initialized: provider=%s, model=%s", self._FACTORY_NAME, model_name)
+        self.client = ZhipuAI(api_key=key)
         self.model_name = model_name
 
     def _max_len(self):
@@ -1334,40 +1324,37 @@ class NewAPIEmbed(OpenAIEmbed):
         self.model_name = model_name.split("___")[0]
 
 
-class OpenRouterEmbed(Base):
-    _FACTORY_NAME = "OpenRouter"
+class LangChainEmbed(Base):
+    """
+    LangChain-backed embedding provider (framework replacement for the
+    self-written OpenAI-compatible thin wrappers).
 
-    def __init__(self, key, model_name, base_url="https://openrouter.ai/api/v1", **kwargs):
+    Routes RAGFlow's embedding calls through ``langchain_openai.OpenAIEmbeddings``
+    instead of the hand-rolled ``openai`` SDK plumbing in :class:`OpenAIEmbed`.
+    It honours the same contract: ``encode`` / ``encode_queries`` return numpy
+    arrays (consumed by ``embedding_service.py`` and ``search.py``), and batch
+    handling reuses :meth:`Base._batched_encode`. This is an *opt-in* provider;
+    default providers are untouched, so switching to it never loses functionality.
+    """
+
+    _FACTORY_NAME = "LangChain"
+
+    def __init__(self, key, model_name="text-embedding-3-small", base_url="https://api.openai.com/v1", **kwargs):
         if not base_url:
-            base_url = "https://openrouter.ai/api/v1"
+            base_url = "https://api.openai.com/v1"
+        from langchain_openai import OpenAIEmbeddings
         self.base_url = ensure_v1(base_url)
-        try:
-            payload = json.loads(key)
-        except (JSONDecodeError, TypeError):
-            api_key = key
-            provider_order = ""
-        else:
-            if isinstance(payload, dict):
-                api_key = payload.get("api_key", "")
-                provider_order = payload.get("provider_order", "")
-            else:
-                api_key = key
-                provider_order = ""
-        self.client = OpenAI(api_key=api_key, base_url=self.base_url)
         self.model_name = model_name
-        self.provider_order = provider_order
+        self.client = OpenAIEmbeddings(model=model_name, api_key=key, base_url=self.base_url)
 
     def _call(self, batch):
-        extra_body = {"drop_params": True}
-        if self.provider_order:
-            order = [s.strip() for s in self.provider_order.split(",") if s.strip()]
-            extra_body["provider"] = {"order": order, "allow_fallbacks": False}
-        res = self.client.embeddings.create(input=batch, model=self.model_name, encoding_format="float", extra_body=extra_body)
-        return [d.embedding for d in _sorted_by_index(res.data)], total_token_count_from_response(res)
+        vectors = self.client.embed_documents(batch)
+        tokens = sum(num_tokens_from_string(t) for t in batch)
+        return vectors, tokens
 
     def encode(self, texts: list):
-        return self._batched_encode(texts, self._call, batch_size=16, truncate_to=8191)
+        return self._batched_encode(texts, self._call, batch_size=16)
 
     def encode_queries(self, text):
-        vectors, token_count = self._batched_encode([text], self._call, batch_size=16, truncate_to=8191)
+        vectors, token_count = self._batched_encode([text], self._call, batch_size=16)
         return vectors[0], token_count
