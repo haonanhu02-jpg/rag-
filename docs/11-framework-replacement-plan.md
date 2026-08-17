@@ -2,7 +2,7 @@
 document_id: FRAMEWORK-REPLACEMENT-PLAN
 document_role: RAGFlow 三桶拆解与 LangChain/LangGraph 框架替代实施计划（下一轮路线图提议）
 status: proposed
-document_version: "0.2.0"
+document_version: "0.3.0"
 created_at: "2026-08-17"
 last_updated_at: "2026-08-17"
 project_root: "D:/download/ragflow-agent"
@@ -216,8 +216,22 @@ C.1 复核（0 代码，必做） → C.2 微整合（可选） → C.3 候选�
 
 #### FR-T03：能力矩阵与 ADR 建议
 
-- **能力矩阵回填**：待用户批准后更新 `docs/02-ragflow-capability-matrix.md`（属维护文档，不擅自修改）。
-- **ADR 建议**：FR-T01/FR-T02 是 0 代码复核，不改变实现，**无需 ADR**；若采纳任何 C.2/C.3 代码任务，先按 AGENTS.md 形成 ADR 并经用户确认。
+- **能力矩阵回填**：已获用户批准并更新 `docs/02-ragflow-capability-matrix.md`（CAP-27/36/37 流式状态，2026-08-17）。
+- **ADR 建议**：FR-T01/FR-T02 是 0 代码复核，不改变实现，**无需 ADR**；FR-T11 流式由用户确认采纳后实施；后续任何 C.2/C.3 代码任务，先按 AGENTS.md 形成 ADR 并经用户确认。
+
+### C.6 执行记录：FR-T11 固定 RAG 流式（2026-08-17）
+
+- **[决策]** 用户确认采纳 G-2，实施固定 RAG 流式。
+- **改动文件**：
+  - `knowledge/ports/generation.py`：新增 `ChatStreamChunk` 与可选流式协议 `ChatStreamProviderPort`。
+  - `knowledge/infrastructure/models/langchain_openai.py`：`LangChainChatProvider.stream`（`ChatOpenAI.astream`，逐 token delta + 结束 usage）。
+  - `knowledge/application/fixed_rag.py`：抽取 `_prepare` 共享检索/上下文，新增 `FixedRagStreamEvent` 与 `answer_stream`（无证据短路径只发 done；不支持流式的 provider 明确报 501）。
+  - `api/routes/knowledge.py`：新增 SSE 端点 `POST /v1/rag/query/stream`。
+  - `tests/fakes/minimum_rag.py`：`StubChatProvider` 增加 `stream`。
+  - 新增 `tests/unit/rag/test_answer_stream.py`（无证据单 done、delta+done、不支持流式报错）。
+- **门禁结果**：`ruff`（本次改动文件通过；`generation.py` 的 RUF003/E501 来自既有 `##` 注释批次，与本次无关）；`mypy` 409 文件无问题；`pytest` 315 passed、19 skipped（均为未配置外部服务的预期 skip）。
+- **API 契约**：`/v1/rag/query/stream` 返回 `text/event-stream`；每条 `data: <json>`，事件类型 `delta`（字段 `delta`）与 `done`（字段 `answer/citations/trace_id/prompt_version/model_id/input_tokens/output_tokens`）。
+- **无功能损失**：非流式 `/v1/rag/query` 行为不变（同一 `_prepare` + `FIXED_RAG_SYSTEM_PROMPT`）；`StubChatProvider.generate` 内容保持与改动前一致。
 
 ---
 
@@ -246,5 +260,6 @@ C.1 复核（0 代码，必做） → C.2 微整合（可选） → C.3 候选�
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-08-17 | 0.3.0 | 执行 FR-T11：固定 RAG 流式实现（SSE 端点 /v1/rag/query/stream），门禁 ruff/mypy/315 passed；回填能力矩阵 CAP-27/36/37 流式状态 |
 | 2026-08-17 | 0.2.0 | 执行 FR-T01：逐项核对 Part B 与代码/测试一致，修正记忆行措辞；FR-T02：对 G-1 至 G-4 作出决策（G-3/G-4 不推荐）；FR-T03：能力矩阵回填待批准，0 代码复核无需 ADR |
 | 2026-08-17 | 0.1.0 | 创建：RAGFlow 三桶拆解、映射到本项目代码的现状复核、下一轮路线图实施计划提议 |
