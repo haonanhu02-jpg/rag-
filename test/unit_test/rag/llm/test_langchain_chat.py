@@ -27,11 +27,13 @@ attribute injection to avoid real client construction. They pin:
   ``int`` token count);
 * the ``last_usage`` split mapping (langchain ``input/output_tokens`` ->
   RAGFlow ``prompt/completion_tokens``);
-* the explicit no-tools scope boundary.
+* the tool-bound paths (``async_chat_with_tools`` / ``async_chat_streamly_with_tools``)
+  via the OpenAI-style tool-call adapter.
 """
 
 import inspect
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -150,13 +152,146 @@ async def test_async_chat_streamly_yields_chunks_then_int():
 
 
 # --------------------------------------------------------------------------- #
-# Tool scope boundary.
+# Tool paths.
 # --------------------------------------------------------------------------- #
+class _FakeToolLLM:
+    """ChatOpenAI-shaped fake for the tool loop: one tool call per invoke."""
+
+    def __init__(self, *, tool_calls: int = 1):
+        self.tool_calls = tool_calls
+        self.tools = []
+        self.ainvoke_calls: list = []
+        self.astream_calls: list = []
+
+    def bind_tools(self, tools):
+        self.tools = tools
+        return self
+
+    async def ainvoke(self, messages, **kwargs):
+        self.ainvoke_calls.append((messages, kwargs))
+        if self.tool_calls:
+            self.tool_calls -= 1
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "get_weather", "args": {"city": "Beijing"}, "id": "call_1", "type": "tool_call"}
+                ],
+                usage_metadata={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10},
+            )
+        return AIMessage(content="Beijing: 21C sunny.", usage_metadata={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10})
+
+    async def astream(self, messages, **kwargs):
+        self.astream_calls.append((messages, kwargs))
+        if self.tool_calls:
+            self.tool_calls -= 1
+            yield AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {"name": "get_weather", "args": '{"city": "Beijing"}', "id": "call_1", "index": 0}
+                ],
+                usage_metadata={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10},
+            )
+        else:
+            yield AIMessageChunk(content="Beijing: 21C sunny.", usage_metadata={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10})
+
+
+class _FakeToolSession:
+    def __init__(self):
+        self.calls: list = []
+
+    async def tool_call_async(self, name, arguments):
+        self.calls.append((name, arguments))
+        return f"{arguments['city']}: 21C sunny"
+
+
+def _make_tool_chat(tool_calls: int = 1):
+    inst = LangChainChat.__new__(LangChainChat)
+    inst.model_name = "gpt-4o"
+    inst.base_url = "https://api.openai.com/v1"
+    inst.llm = _FakeToolLLM(tool_calls=tool_calls)
+    inst.max_retries = 1
+    inst.base_delay = 0.01
+    inst.max_rounds = 3
+    inst.is_tools = True
+    inst.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    inst.toolcall_session = _FakeToolSession()
+    inst.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return inst
+
+
+def test_tool_call_adapter_produces_openai_style_object():
+    from rag.llm.chat_model import _langchain_tool_call_to_openai
+
+    tc = _langchain_tool_call_to_openai(
+        {"name": "get_weather", "args": {"city": "Beijing"}, "id": "call_1", "type": "tool_call"},
+        index=2,
+    )
+    assert tc.id == "call_1"
+    assert tc.index == 2
+    assert tc.function.name == "get_weather"
+    # RAGFlow's tool loop parses .function.arguments as JSON.
+    assert json.loads(tc.function.arguments) == {"city": "Beijing"}
+
+
 @pytest.mark.asyncio
-async def test_tool_paths_raise_not_implemented():
-    chat = _make_chat()
-    with pytest.raises(NotImplementedError):
-        await chat.async_chat_with_tools("system", [{"role": "user", "content": "x"}])
-    with pytest.raises(NotImplementedError):
-        async for _ in chat.async_chat_streamly_with_tools("system", [{"role": "user", "content": "x"}]):
-            pass
+async def test_async_chat_with_tools_runs_tool_then_answers():
+    chat = _make_tool_chat()
+    answer, tokens = await chat.async_chat_with_tools("sys", [{"role": "user", "content": "weather?"}])
+
+    assert chat.toolcall_session.calls == [("get_weather", {"city": "Beijing"})]
+    assert "Beijing: 21C sunny." in answer
+    assert "get_weather" in answer  # verbose tool-use marker in the answer
+    assert tokens == 20  # two rounds: tool call (10) + final answer (10)
+    assert chat.last_usage == {"prompt_tokens": 16, "completion_tokens": 4, "total_tokens": 20}
+
+
+@pytest.mark.asyncio
+async def test_async_chat_with_tools_answers_directly_when_no_tool_needed():
+    chat = _make_tool_chat(tool_calls=0)
+    answer, tokens = await chat.async_chat_with_tools("sys", [{"role": "user", "content": "hi"}])
+
+    assert chat.toolcall_session.calls == []
+    assert answer == "Beijing: 21C sunny."
+    assert tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_async_chat_streamly_with_tools_yields_tool_run_then_answer():
+    chat = _make_tool_chat()
+    out = [item async for item in chat.async_chat_streamly_with_tools("sys", [{"role": "user", "content": "weather?"}])]
+
+    assert chat.toolcall_session.calls == [("get_weather", {"city": "Beijing"})]
+    # Streaming contract: <think>Running...> marker, verbose tool use, final int.
+    assert "<think>Running the get_weather tool...</think>" in out
+    assert any("Beijing: 21C sunny." in str(item) for item in out)
+    assert out[-1] == 20
+    assert isinstance(out[-1], int)
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_keeps_history_between_rounds():
+    chat = _make_tool_chat()
+    await chat.async_chat_with_tools("sys", [{"role": "user", "content": "weather?"}])
+
+    # First round sent the user message; second round also carried the tool result.
+    messages = chat.llm.ainvoke_calls
+    assert len(messages) == 2
+    assert messages[0][0][0]["role"] == "system"
+    assert messages[1][0][0]["role"] == "system"
+    # Tool result appended between rounds (OpenAI tool protocol messages).
+    roles = [m["role"] for m in messages[1][0]]
+    assert "tool" in roles
+    assert "assistant" in roles

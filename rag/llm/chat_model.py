@@ -2363,6 +2363,24 @@ def _langchain_finish_reason(message) -> str:
     return meta.get("finish_reason", "") or ""
 
 
+def _langchain_tool_call_to_openai(tool_call: dict, index: int):
+    """Adapt a langchain ``tool_call`` dict to the OpenAI-style object the
+    RAGFlow tool loop expects (``tc.function.name`` / ``tc.function.arguments`` /
+    ``tc.id`` / ``tc.index``), so :meth:`Base._append_history_batch` and the
+    shared ``_exec_tool`` logic can be reused unchanged.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=tool_call.get("id", ""),
+        index=index,
+        function=SimpleNamespace(
+            name=tool_call.get("name", ""),
+            arguments=json.dumps(tool_call.get("args", {}), ensure_ascii=False),
+        ),
+    )
+
+
 class LangChainChat(Base):
     """
     LangChain-backed chat provider (framework replacement for the self-written
@@ -2495,17 +2513,232 @@ class LangChainChat(Base):
             yield ans, chunk_tokens
 
     async def async_chat_with_tools(self, system, history, gen_conf=None, **kwargs):
-        raise NotImplementedError(
-            "LangChain provider: tool-bound chat is not implemented in the first "
-            "version. Use a default provider (e.g. OpenAI / DeepSeek / Ollama) for "
-            "agentic flows, or the non-tool fixed-RAG path with this provider."
+        gen_conf = dict(gen_conf or {})
+        gen_conf = self._clean_conf(gen_conf)
+        gen_conf, extra_request_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="base",
+            gen_conf=gen_conf,
+            request_kwargs={},
         )
+        if system and history and history[0].get("role") != "system":
+            history.insert(0, {"role": "system", "content": system})
+
+        ans = ""
+        tk_count = 0
+        agg_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        def _add_round_usage(response):
+            nonlocal tk_count
+            u = _langchain_usage(getattr(response, "usage_metadata", None))
+            agg_usage["prompt_tokens"] += u["prompt_tokens"]
+            agg_usage["completion_tokens"] += u["completion_tokens"]
+            agg_usage["total_tokens"] += u["total_tokens"]
+            tk_count = agg_usage["total_tokens"]
+            self.last_usage = dict(agg_usage)
+
+        bound_llm = self.llm.bind_tools(self.tools)
+        request_kwargs = {**gen_conf, **extra_request_kwargs}
+
+        async def _exec_tool(tc):
+            name = tc.function.name
+            try:
+                args = json_repair.loads(tc.function.arguments)
+                if not isinstance(args, dict):
+                    raise TypeError(f"Tool arguments for {name} must be a JSON object, got {type(args).__name__}")
+                if hasattr(self.toolcall_session, "tool_call_async"):
+                    result = await self.toolcall_session.tool_call_async(name, args)
+                else:
+                    result = await thread_pool_exec(self.toolcall_session.tool_call, name, args)
+                return tc, name, args, result, None
+            except Exception as e:
+                logging.exception(f"Tool call failed: {tc}")
+                return tc, name, {}, None, e
+
+        hist = deepcopy(history)
+        for attempt in range(self.max_retries + 1):
+            history = deepcopy(hist)
+            try:
+                for _ in range(self.max_rounds + 1):
+                    logging.info(f"{self.tools=}")
+                    response = await bound_llm.ainvoke(history, **request_kwargs)
+                    _add_round_usage(response)
+                    tool_calls = getattr(response, "tool_calls", None) or []
+                    if not tool_calls:
+                        content = getattr(response, "content", None) or ""
+                        if content:
+                            ans += content
+                            if _langchain_finish_reason(response) == "length":
+                                ans = self._length_stop(ans)
+                        return ans, tk_count
+
+                    tcs = [_langchain_tool_call_to_openai(tc, i) for i, tc in enumerate(tool_calls)]
+                    logging.info(f"Response tool_calls={[tc.get('name') for tc in tool_calls]}")
+                    results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+                    history = self._append_history_batch(history, results)
+                    for tc, name, args, result, err in results:
+                        ans += self._verbose_tool_use(name, args, err if err else result)
+
+                logging.warning(f"Exceed max rounds: {self.max_rounds}")
+                history.append({"role": "user", "content": f"Exceed max rounds: {self.max_rounds}"})
+                response = await bound_llm.ainvoke(history, **request_kwargs)
+                _add_round_usage(response)
+                content = getattr(response, "content", None) or ""
+                ans += content
+                if _langchain_finish_reason(response) == "length":
+                    ans = self._length_stop(ans)
+                return ans, tk_count
+            except Exception as e:
+                e = await self._exceptions_async(e, attempt)
+                if e:
+                    return e, tk_count
+
+        assert False, "Shouldn't be here."
 
     async def async_chat_streamly_with_tools(self, system, history, gen_conf=None, **kwargs):
-        raise NotImplementedError(
-            "LangChain provider: tool-bound chat is not implemented in the first "
-            "version. Use a default provider (e.g. OpenAI / DeepSeek / Ollama) for "
-            "agentic flows, or the non-tool fixed-RAG path with this provider."
+        gen_conf = dict(gen_conf or {})
+        gen_conf = self._clean_conf(gen_conf)
+        gen_conf, extra_request_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="base",
+            gen_conf=gen_conf,
+            request_kwargs={},
         )
-        yield  # pragma: no cover - unreachable; makes this an async generator so
-        # `async for` on the caller side surfaces the NotImplementedError above.
+        if system and history and history[0].get("role") != "system":
+            history.insert(0, {"role": "system", "content": system})
+
+        total_tokens = 0
+        agg_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        hist = deepcopy(history)
+        bound_llm = self.llm.bind_tools(self.tools)
+        request_kwargs = {**gen_conf, **extra_request_kwargs}
+        reasoning_start = False
+
+        def _commit_round(round_usage, round_estimate):
+            nonlocal total_tokens
+            if round_usage and round_usage["total_tokens"]:
+                agg_usage["prompt_tokens"] += round_usage["prompt_tokens"]
+                agg_usage["completion_tokens"] += round_usage["completion_tokens"]
+                agg_usage["total_tokens"] += round_usage["total_tokens"]
+            else:
+                agg_usage["total_tokens"] += round_estimate
+            total_tokens = agg_usage["total_tokens"]
+            self.last_usage = dict(agg_usage)
+
+        async def _exec_tool(tc):
+            name = tc.function.name
+            try:
+                args = json_repair.loads(tc.function.arguments)
+                if not isinstance(args, dict):
+                    raise TypeError(f"Tool arguments for {name} must be a JSON object, got {type(args).__name__}")
+                if hasattr(self.toolcall_session, "tool_call_async"):
+                    result = await self.toolcall_session.tool_call_async(name, args)
+                else:
+                    result = await thread_pool_exec(self.toolcall_session.tool_call, name, args)
+                return tc, name, args, result, None
+            except Exception as e:
+                logging.exception(f"Tool call failed: {tc}")
+                return tc, name, {}, None, e
+
+        for attempt in range(self.max_retries + 1):
+            history = deepcopy(hist)
+            try:
+                for _round in range(self.max_rounds + 1):
+                    reasoning_start = False
+                    logging.info(f"[Tool loop] Deciding what to do next (step {_round + 1}); available tools: {', '.join(t['function']['name'] for t in self.tools)}")
+
+                    answer = ""
+                    round_estimate = 0
+                    round_usage = None
+                    final_tool_calls = {}
+
+                    async for chunk in bound_llm.astream(history, **request_kwargs):
+                        usage_meta = getattr(chunk, "usage_metadata", None)
+                        if usage_meta and usage_meta.get("total_tokens"):
+                            round_usage = _langchain_usage(usage_meta)
+
+                        tool_calls = getattr(chunk, "tool_calls", None) or []
+                        for tool_call in tool_calls:
+                            index = tool_call.get("index", 0)
+                            final_tool_calls[index] = tool_call
+                        if tool_calls:
+                            continue
+
+                        content = getattr(chunk, "content", None) or ""
+                        _reasoning = getattr(chunk, "reasoning_content", None) or getattr(chunk, "reasoning", None)
+                        if _reasoning:
+                            ans = ""
+                            if not reasoning_start:
+                                reasoning_start = True
+                                ans = "<think>"
+                            ans += _reasoning + "</think>"
+                            yield ans
+                        else:
+                            reasoning_start = False
+                            answer += content
+                            if content:
+                                yield content
+
+                        if not (usage_meta and usage_meta.get("total_tokens")):
+                            round_estimate += num_tokens_from_string(content)
+
+                        if _langchain_finish_reason(chunk) == "length":
+                            yield self._length_stop("")
+
+                    _commit_round(round_usage, round_estimate)
+
+                    if answer and not final_tool_calls:
+                        logging.info(f"[Tool loop] Answering directly at step {_round + 1} — no tool needed.")
+                        yield total_tokens
+                        return
+
+                    tcs = [_langchain_tool_call_to_openai(tc, idx) for idx, tc in sorted(final_tool_calls.items())]
+                    logging.info(f"[Tool loop] Step {_round + 1}: running {', '.join(tc.function.name for tc in tcs)}...")
+                    for tc in tcs:
+                        yield f"<think>Running the {tc.function.name} tool...</think>"
+                    results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+
+                    _terminal = getattr(self, "terminal_tools", None)
+                    if _terminal:
+                        for tc, name, args, result, err in results:
+                            if name in _terminal and not err:
+                                logging.info(f"[Tool loop] The {name} tool produced the final answer — done.")
+                                out = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                                if out:
+                                    yield out
+                                yield total_tokens
+                                return
+
+                    history = self._append_history_batch(history, results)
+                    for tc, name, args, result, err in results:
+                        yield self._verbose_tool_use(name, args, err if err else result)
+
+                logging.warning(f"Exceed max rounds: {self.max_rounds}")
+                history.append({"role": "user", "content": f"Exceed max rounds: {self.max_rounds}"})
+
+                fb_estimate = 0
+                fb_usage = None
+                async for chunk in bound_llm.astream(history, **request_kwargs):
+                    usage_meta = getattr(chunk, "usage_metadata", None)
+                    if usage_meta and usage_meta.get("total_tokens"):
+                        fb_usage = _langchain_usage(usage_meta)
+                    content = getattr(chunk, "content", None) or ""
+                    if not content:
+                        continue
+                    if not (usage_meta and usage_meta.get("total_tokens")):
+                        fb_estimate += num_tokens_from_string(content)
+                    yield content
+
+                _commit_round(fb_usage, fb_estimate)
+                yield total_tokens
+                return
+
+            except Exception as e:
+                e = await self._exceptions_async(e, attempt)
+                if e:
+                    logging.error(f"async_chat_streamly failed: {e}")
+                    yield e
+                    yield total_tokens
+                    return
+
+        assert False, "Shouldn't be here."
